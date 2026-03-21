@@ -791,24 +791,56 @@ class MLXMultimodalLM:
         )
         return save_frames_to_temp(frames)
 
-    def _generate_native_video(
+    def _collect_video_inputs(self, messages: list[dict]) -> dict[int, list]:
+        """Collect video inputs from messages, keyed by message index.
+
+        Handles both 'video' and 'video_url' content types, including
+        Pydantic model conversion.
+        """
+        video_inputs: dict[int, list] = {}
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "video":
+                    video_inputs.setdefault(msg_idx, []).append(
+                        item.get("video", item.get("url", ""))
+                    )
+                elif item_type == "video_url":
+                    vid_url = item.get("video_url", {})
+                    if isinstance(vid_url, str):
+                        video_inputs.setdefault(msg_idx, []).append(vid_url)
+                    elif isinstance(vid_url, dict):
+                        url = vid_url.get("url", "")
+                        if url:
+                            video_inputs.setdefault(msg_idx, []).append(url)
+        return video_inputs
+
+    def _prepare_native_video_inputs(
         self,
         messages: list[dict],
-        max_tokens: int = 256,
-        temperature: float = 0.7,
         video_fps: float = DEFAULT_FPS,
         video_max_frames: int = MAX_FRAMES,
-        **kwargs,
-    ) -> MLLMOutput:
-        """Generate using native video pipeline (Qwen-family models).
+        tools: list | None = None,
+    ) -> tuple[str, dict]:
+        """Preprocess messages into prompt + generation kwargs for native video.
 
-        Uses mlx-vlm's process_vision_info + HF processor to produce proper
-        video_grid_thw, pixel_values_videos, and timestamp-interleaved prompts.
-        This activates 3D conv frame pairing, M-RoPE temporal position IDs,
-        and per-frame timestamp tokens in the model.
+        Mirrors the preprocessing in mlx_vlm.video_generate.main() so that
+        upstream improvements are easy to adopt. Returns the formatted prompt
+        text and a dict of kwargs ready to pass to video_generate.generate().
+
+        Currently Qwen-family-specific (video_token_id / video_token_index).
         """
         import mlx.core as mx
-        from mlx_vlm import generate
 
         try:
             from mlx_vlm.video_generate import process_vision_info
@@ -824,8 +856,15 @@ class MLXMultimodalLM:
         )
 
         # Use HF processor's chat template (handles timestamp interleaving)
+        template_kwargs: dict = {}
+        if tools:
+            template_kwargs["tools"] = tools
+
         text = self.processor.apply_chat_template(
-            native_messages, tokenize=False, add_generation_prompt=True
+            native_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
         )
 
         # Extract vision inputs via mlx-vlm's process_vision_info
@@ -850,7 +889,7 @@ class MLXMultimodalLM:
             pixel_values = mx.array(pixel_values)
         mask = mx.array(inputs["attention_mask"])
 
-        gen_kwargs = {}
+        gen_kwargs: dict = {}
         if inputs.get("video_grid_thw", None) is not None:
             gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
@@ -859,13 +898,43 @@ class MLXMultimodalLM:
         gen_kwargs["input_ids"] = input_ids
         gen_kwargs["pixel_values"] = pixel_values
         gen_kwargs["mask"] = mask
-        gen_kwargs["temperature"] = temperature
 
         grid_thw_info = gen_kwargs.get("video_grid_thw")
         logger.info(
             f"Native video: {input_ids.size} input tokens, "
             f"video_grid_thw={grid_thw_info.tolist() if grid_thw_info is not None else None}"
         )
+
+        return text, gen_kwargs
+
+    def _generate_native_video(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+        tools: list | None = None,
+        **kwargs,
+    ) -> MLLMOutput:
+        """Generate using native video pipeline (Qwen-family models).
+
+        Delegates preprocessing to _prepare_native_video_inputs and generation
+        to mlx_vlm.video_generate.generate(), keeping our code aligned with
+        upstream's video pipeline so improvements are easy to adopt.
+        """
+        try:
+            from mlx_vlm.video_generate import generate
+        except ImportError:
+            raise ImportError(
+                "mlx_vlm.video_generate is required for native video support. "
+                "Upgrade with: pip install --upgrade mlx-vlm"
+            )
+
+        text, gen_kwargs = self._prepare_native_video_inputs(
+            messages, video_fps, video_max_frames, tools
+        )
+        gen_kwargs["temperature"] = temperature
 
         result = generate(
             self.model,
@@ -1246,38 +1315,14 @@ class MLXMultimodalLM:
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
 
-        # Pop video params early so they're available for the first pass
+        # Pop params early so they don't leak into mlx_vlm.generate()
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        tools = kwargs.pop("tools", None)
+        use_cache = kwargs.pop("use_cache", True)
 
-        # First pass: collect and process video inputs per message index
-        _msg_video_inputs: dict[int, list] = {}
-        for msg_idx, msg in enumerate(messages):
-            content = msg.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                # Convert Pydantic models to dicts, excluding None fields
-                if hasattr(item, "model_dump"):
-                    item = item.model_dump(exclude_none=True)
-                elif hasattr(item, "dict"):
-                    item = {k: v for k, v in item.dict().items() if v is not None}
-
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type", "")
-                if item_type == "video":
-                    _msg_video_inputs.setdefault(msg_idx, []).append(
-                        item.get("video", item.get("url", ""))
-                    )
-                elif item_type == "video_url":
-                    vid_url = item.get("video_url", {})
-                    if isinstance(vid_url, str):
-                        _msg_video_inputs.setdefault(msg_idx, []).append(vid_url)
-                    elif isinstance(vid_url, dict):
-                        url = vid_url.get("url", "")
-                        if url:
-                            _msg_video_inputs.setdefault(msg_idx, []).append(url)
+        # Collect video inputs from messages
+        _msg_video_inputs = self._collect_video_inputs(messages)
 
         # Use native video pipeline for supported models
         if self._video_native and _msg_video_inputs:
@@ -1287,6 +1332,7 @@ class MLXMultimodalLM:
                 temperature=temperature,
                 video_fps=video_fps,
                 video_max_frames=video_max_frames,
+                tools=tools,
                 **kwargs,
             )
 
@@ -1393,8 +1439,7 @@ class MLXMultimodalLM:
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
 
-        # Pop tools so they don't leak into mlx_vlm.generate()/stream_generate()
-        tools = kwargs.pop("tools", None)
+        # Build template kwargs for tool definitions (tools already popped above)
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
@@ -1432,7 +1477,6 @@ class MLXMultimodalLM:
 
         from mlx_vlm.models import cache as vlm_cache
 
-        use_cache = kwargs.pop("use_cache", True)
         cache_entry = None
         prefix_match_len = 0
         vision_embeddings = None
@@ -1667,42 +1711,21 @@ class MLXMultimodalLM:
         all_image_urls = []  # Raw URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
-        # Pop video params early so they're available for the first pass
+        # Pop params early so they don't leak into mlx_vlm.generate()
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        tools = kwargs.pop("tools", None)
+        use_cache = kwargs.pop("use_cache", True)
 
-        # First pass: collect and process video inputs per message index
-        _msg_video_inputs: dict[int, list] = {}
-        for msg_idx, msg in enumerate(messages):
-            content = msg.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                # Convert Pydantic models to dicts, excluding None fields
-                if hasattr(item, "model_dump"):
-                    item = item.model_dump(exclude_none=True)
-                elif hasattr(item, "dict"):
-                    item = {k: v for k, v in item.dict().items() if v is not None}
+        # Collect video inputs from messages
+        _msg_video_inputs = self._collect_video_inputs(messages)
 
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type", "")
-                if item_type == "video":
-                    _msg_video_inputs.setdefault(msg_idx, []).append(
-                        item.get("video", item.get("url", ""))
-                    )
-                elif item_type == "video_url":
-                    vid_url = item.get("video_url", {})
-                    if isinstance(vid_url, str):
-                        _msg_video_inputs.setdefault(msg_idx, []).append(vid_url)
-                    elif isinstance(vid_url, dict):
-                        url = vid_url.get("url", "")
-                        if url:
-                            _msg_video_inputs.setdefault(msg_idx, []).append(url)
-
-        # Use native video pipeline for supported models
-        # NOTE: native video uses a blocking generate() call, so this yields
-        # a single chunk rather than streaming incrementally.
+        # Use native video pipeline for supported models.
+        # NOTE: Native video yields a single chunk (not incremental streaming)
+        # because mlx_vlm.video_generate has no streaming API. The event loop
+        # is NOT blocked at the server level — SimpleEngine wraps this in
+        # asyncio.to_thread(). True token-level streaming requires upstream
+        # mlx-vlm support for video stream_generate.
         if self._video_native and _msg_video_inputs:
             output = self._generate_native_video(
                 messages=messages,
@@ -1710,6 +1733,7 @@ class MLXMultimodalLM:
                 temperature=temperature,
                 video_fps=video_fps,
                 video_max_frames=video_max_frames,
+                tools=tools,
                 **kwargs,
             )
             yield output
@@ -1796,9 +1820,7 @@ class MLXMultimodalLM:
             all_images.extend(self._prepare_images(all_image_urls))
         all_images.extend(all_video_frames)
 
-        # Apply chat template directly - messages are already properly structured
-        # Pop tools so they don't leak into mlx_vlm.generate()/stream_generate()
-        tools = kwargs.pop("tools", None)
+        # Build template kwargs for tool definitions (tools already popped above)
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
@@ -1834,7 +1856,6 @@ class MLXMultimodalLM:
 
         prompt_cache = None
         cache_hit = False
-        use_cache = kwargs.pop("use_cache", True)
 
         if use_cache and self._cache_manager is not None and all_images:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(

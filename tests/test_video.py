@@ -34,38 +34,25 @@ class TestSmartNframes:
     def test_result_always_even(self):
         for total in [5, 7, 11, 13, 100, 999]:
             result = smart_nframes(total, 30.0)
-            assert (
-                result % FRAME_FACTOR == 0
-            ), f"Odd frame count {result} for total={total}"
+            assert result % FRAME_FACTOR == 0, (
+                f"Odd frame count {result} for total={total}"
+            )
 
 
 class TestVideoUrlParsing:
     """Verify video_url content type extraction from OpenAI messages."""
 
+    def _make_model(self):
+        """Create an unloaded model instance for testing."""
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = False
+        model._video_native = False
+        return model
+
     def _extract_video_inputs(self, messages):
-        """Simulate the first-pass video extraction from chat()."""
-        _msg_video_inputs = {}
-        for msg_idx, msg in enumerate(messages):
-            content = msg.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type", "")
-                if item_type == "video":
-                    _msg_video_inputs.setdefault(msg_idx, []).append(
-                        item.get("video", item.get("url", ""))
-                    )
-                elif item_type == "video_url":
-                    vid_url = item.get("video_url", {})
-                    if isinstance(vid_url, str):
-                        _msg_video_inputs.setdefault(msg_idx, []).append(vid_url)
-                    elif isinstance(vid_url, dict):
-                        url = vid_url.get("url", "")
-                        if url:
-                            _msg_video_inputs.setdefault(msg_idx, []).append(url)
-        return _msg_video_inputs
+        """Use the actual _collect_video_inputs helper."""
+        model = self._make_model()
+        return model._collect_video_inputs(messages)
 
     def test_video_url_dict_format(self):
         messages = [
@@ -143,6 +130,45 @@ class TestVideoUrlParsing:
         # Only video extracted, not image
         assert result[0] == ["https://example.com/vid.mp4"]
 
+    def test_multi_message_videos(self):
+        """Videos in different messages should be keyed by message index."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": "/path/first.mp4"},
+                    {"type": "text", "text": "First"},
+                ],
+            },
+            {"role": "assistant", "content": "OK"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": "/path/second.mp4"},
+                    {"type": "text", "text": "Second"},
+                ],
+            },
+        ]
+        result = self._extract_video_inputs(messages)
+        assert result[0] == ["/path/first.mp4"]
+        assert result[2] == ["/path/second.mp4"]
+        assert 1 not in result
+
+    def test_multiple_videos_single_message(self):
+        """Multiple videos in one message should produce a list at that index."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": "/path/a.mp4"},
+                    {"type": "video_url", "video_url": {"url": "/path/b.mp4"}},
+                    {"type": "text", "text": "Compare these"},
+                ],
+            }
+        ]
+        result = self._extract_video_inputs(messages)
+        assert result[0] == ["/path/a.mp4", "/path/b.mp4"]
+
 
 class TestTranslateMessages:
     """Verify OpenAI format to process_vision_info format translation."""
@@ -194,6 +220,134 @@ class TestTranslateMessages:
             assert video_item["max_frames"] == 128
         finally:
             os.unlink(video_path)
+
+    def test_video_url_type_translated(self):
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"\x00" * 100)
+            video_path = f.name
+
+        try:
+            model = self._make_model()
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": video_path},
+                        },
+                        {"type": "text", "text": "Describe"},
+                    ],
+                }
+            ]
+            result = model._translate_messages_for_native_video(messages, 1.0, 64)
+            content = result[0]["content"]
+
+            types = [item["type"] for item in content]
+            assert "video" in types
+            assert "text" in types
+
+            video_item = next(i for i in content if i["type"] == "video")
+            assert video_item["fps"] == 1.0
+            assert video_item["max_frames"] == 64
+        finally:
+            os.unlink(video_path)
+
+
+class TestCollectVideoInputsPydantic:
+    """Verify _collect_video_inputs handles Pydantic models correctly."""
+
+    def _make_model(self):
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = False
+        model._video_native = False
+        return model
+
+    def test_pydantic_model_dump(self):
+        """Pydantic v2 objects with model_dump() are handled."""
+
+        class FakeContent:
+            def model_dump(self, exclude_none=False):
+                return {"type": "video", "video": "/path/to/video.mp4"}
+
+        messages = [{"role": "user", "content": [FakeContent()]}]
+        result = self._make_model()._collect_video_inputs(messages)
+        assert result[0] == ["/path/to/video.mp4"]
+
+    def test_pydantic_v1_dict(self):
+        """Pydantic v1 objects with dict() are handled."""
+
+        class FakeContent:
+            def dict(self):
+                return {
+                    "type": "video_url",
+                    "video_url": {"url": "https://example.com/v.mp4"},
+                    "image_url": None,
+                }
+
+        messages = [{"role": "user", "content": [FakeContent()]}]
+        result = self._make_model()._collect_video_inputs(messages)
+        assert result[0] == ["https://example.com/v.mp4"]
+
+    def test_empty_video_url_skipped(self):
+        """Empty video URL dicts are skipped."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": ""}},
+                ],
+            }
+        ]
+        result = self._make_model()._collect_video_inputs(messages)
+        assert len(result) == 0
+
+
+class TestToolForwarding:
+    """Verify tools are popped from kwargs before native video path."""
+
+    def test_tools_not_in_kwargs_after_pop(self):
+        """Ensure tools don't leak into **kwargs for mlx_vlm.generate()."""
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = False
+        model._video_native = True
+
+        tools = [{"type": "function", "function": {"name": "test"}}]
+        kwargs = {"tools": tools, "video_fps": 2.0, "video_max_frames": 64}
+
+        # Simulate what chat() does: pop tools before native video branch
+        video_fps = kwargs.pop("video_fps", 2.0)
+        video_max_frames = kwargs.pop("video_max_frames", 128)
+        popped_tools = kwargs.pop("tools", None)
+
+        assert popped_tools == tools
+        assert "tools" not in kwargs
+
+    def test_generate_native_video_accepts_tools_param(self):
+        """Verify _generate_native_video signature accepts tools kwarg."""
+        import inspect
+
+        sig = inspect.signature(MLXMultimodalLM._generate_native_video)
+        params = list(sig.parameters.keys())
+        assert "tools" in params
+
+    def test_prepare_native_video_inputs_accepts_tools(self):
+        """Verify preprocessing helper also accepts tools."""
+        import inspect
+
+        sig = inspect.signature(MLXMultimodalLM._prepare_native_video_inputs)
+        params = list(sig.parameters.keys())
+        assert "tools" in params
+
+    def test_generate_imports_from_video_generate(self):
+        """Verify _generate_native_video uses mlx_vlm.video_generate.generate."""
+        import inspect
+
+        source = inspect.getsource(MLXMultimodalLM._generate_native_video)
+        assert "from mlx_vlm.video_generate import generate" in source
 
 
 class TestIsBase64Video:

@@ -3,9 +3,12 @@
 Utility functions for text processing and model detection.
 """
 
+import logging
 import re
 
 from .models import Message
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Special Token Patterns
@@ -105,6 +108,12 @@ def clean_output_text(text: str) -> str:
 # Streaming Tool Call Filter
 # =============================================================================
 
+# Safety cap for tool call buffer (bytes). If a tool call block never closes,
+# the buffer is capped to prevent unbounded memory growth. In practice, the
+# buffer is bounded by max_tokens (~100KB at 32768 tokens), but this cap
+# protects against pathological cases.
+_MAX_TOOL_BUFFER_BYTES = 1_048_576  # 1 MB
+
 # Tags that delimit tool call blocks in streaming output.
 # Content inside these tags should be suppressed during streaming because
 # it will be re-emitted as structured tool_use blocks after parsing.
@@ -113,7 +122,7 @@ _TOOL_CALL_TAGS = [
     ("<tool_call>", "</tool_call>"),
     ("<function=", "</function>"),
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
-    ("[Calling tool", "\n"),
+    ("[Calling tool", "]\n"),  # Qwen3 bracket-style: [Calling tool: func({...})]\n
 ]
 
 
@@ -192,7 +201,15 @@ class StreamingToolCallFilter:
             if self._buffer:
                 return self._scan_for_open()
             return ""
-        # Still inside block - suppress everything
+        # Still inside block - suppress everything but cap buffer size
+        if len(self._buffer) > _MAX_TOOL_BUFFER_BYTES:
+            logger.warning(
+                f"Tool call buffer exceeded {_MAX_TOOL_BUFFER_BYTES} bytes, "
+                f"discarding and exiting block"
+            )
+            self._buffer = ""
+            self._in_block = False
+            self._close_tag = ""
         return ""
 
     def flush(self) -> str:

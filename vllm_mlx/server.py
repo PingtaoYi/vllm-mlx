@@ -98,8 +98,8 @@ from .api.tool_calling import (
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
-    StreamingToolCallFilter,
     StreamingThinkRouter,
+    StreamingToolCallFilter,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -1867,11 +1867,13 @@ async def _stream_anthropic_messages(
             completion_tokens = output.completion_tokens
 
         if delta_text:
-            # Filter special tokens
+            # Accumulate raw text BEFORE special token cleaning for tool parsing
+            accumulated_text += delta_text
+
+            # Filter special tokens for display
             content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
 
             if content:
-                accumulated_text += content
                 # Stage 1: strip tool call markup
                 filtered = tool_filter.process(content)
                 if not filtered:

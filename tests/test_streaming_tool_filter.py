@@ -6,7 +6,6 @@ from vllm_mlx.api.utils import StreamingToolCallFilter
 
 
 class TestStreamingToolCallFilter(unittest.TestCase):
-
     def test_normal_text_passes_through(self):
         f = StreamingToolCallFilter()
         assert f.process("Hello world") == "Hello world"
@@ -110,6 +109,35 @@ class TestStreamingToolCallFilter(unittest.TestCase):
         assert f.process("") == ""
         assert f.process("text") == "text"
         assert f.process("") == ""
+
+    def test_calling_tool_bracket_suppressed(self):
+        """Qwen3 bracket-style: [Calling tool: func({...})]\n"""
+        f = StreamingToolCallFilter()
+        result = f.process('[Calling tool: search({"q": "test"})]\n')
+        assert result == ""
+
+    def test_calling_tool_multiline_json(self):
+        """Multi-line JSON args in bracket-style tool call."""
+        f = StreamingToolCallFilter()
+        r1 = f.process('[Calling tool: search({"q": "test",')
+        r2 = f.process(' "limit": 5})]\n')
+        r3 = f.process("After")
+        assert r1 + r2 + r3 == "After"
+
+    def test_buffer_cap_on_unclosed_block(self):
+        """Buffer should be capped if tool call block never closes."""
+        from vllm_mlx.api.utils import _MAX_TOOL_BUFFER_BYTES
+
+        f = StreamingToolCallFilter()
+        f.process("<minimax:tool_call>")
+        # Feed data exceeding the cap
+        chunk = "x" * 10000
+        for _ in range(_MAX_TOOL_BUFFER_BYTES // 10000 + 2):
+            f.process(chunk)
+        # After cap, filter should have exited the block
+        assert not f._in_block
+        # New text should pass through
+        assert f.process("after") == "after"
 
 
 if __name__ == "__main__":

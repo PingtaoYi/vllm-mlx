@@ -156,15 +156,44 @@ class MLLMBatch:
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
-        Extract cache for a single request (for caching).
+        Extract cache for a single request (for prefix caching).
 
-        Args:
-            idx: Index of request in batch
-
-        Returns:
-            Cache state for that request
+        Handles BatchRotatingKVCache negative left_padding bug:
+        during generation with rotation, left_padding becomes negative,
+        causing extract() to use Python negative indexing and truncate
+        the buffer to only generation tokens instead of the full window.
         """
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        from mlx_lm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        result = []
+        for c in self.cache:
+            if not hasattr(c, "extract"):
+                result.append(None)
+            elif isinstance(c, BatchRotatingKVCache):
+                # Custom extraction: clamp left_padding to >= 0
+                cache = RotatingKVCache(c.max_size)
+                padding = max(0, c.left_padding[idx].item())
+                offset = c.offset[idx].item()
+                cache.keys = c.keys[idx : idx + 1]
+                cache.values = c.values[idx : idx + 1]
+                cache._idx = c._idx
+                if c.rotated:
+                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
+                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache._idx = c.max_size
+                cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+                cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+                cache.offset = offset
+                cache._idx = cache.keys.shape[2]
+                cache.step = getattr(c, "step", c.max_size)
+                cache.keep = getattr(c, "keep", 0)
+                result.append(cache)
+            else:
+                result.append(c.extract(idx))
+        return result
 
 
 class MLLMBatchStats:
@@ -203,32 +232,6 @@ class MLLMBatchStats:
             "num_images_processed": self.num_images_processed,
             "peak_memory": self.peak_memory,
         }
-
-
-def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
-    """
-    Create batch-aware KV cache for the language model.
-
-    Args:
-        model: The language model (model.language_model from VLM)
-        left_padding: Padding amounts for left-padded prompts
-
-    Returns:
-        List of BatchKVCache objects for each layer
-    """
-    from mlx_lm.models.cache import BatchKVCache, KVCache
-
-    def to_batch_cache(c):
-        if isinstance(c, KVCache):
-            return BatchKVCache(left_padding)
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _left_pad_prompts(
@@ -679,10 +682,10 @@ class MLLMBatchGenerator:
         sample_cache = per_request_caches[0][0]
         if not isinstance(sample_cache, (KVCache, RotatingKVCache)):
             raise ValueError(
-                f"MLLM continuous batching requires KVCache or RotatingKVCache "
-                f"but got {type(sample_cache).__name__}. Disable "
-                f"--kv-cache-quantization when using multimodal models with "
-                f"--continuous-batching."
+                f"MLLM continuous batching requires KVCache or "
+                f"RotatingKVCache but got {type(sample_cache).__name__}. "
+                f"Disable --kv-cache-quantization when using multimodal "
+                f"models with --continuous-batching."
             )
 
         # Fix: RotatingKVCache._update_concat does NOT trim on first call —

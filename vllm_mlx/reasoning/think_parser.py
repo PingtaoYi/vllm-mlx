@@ -11,9 +11,10 @@ Supports three scenarios:
 3. No tags: pure content
 
 Performance: The streaming parser uses a simple state machine to track the
-current phase (pre-think / thinking / content). Each token is classified in
-O(1) by checking only the delta text — the accumulated output is never
-rescanned. This keeps per-token overhead constant regardless of output length.
+current phase (pre-think / thinking / content). Tag completion is detected
+against the accumulated text for correctness when `<think>` / `</think>` are
+split across delta boundaries, but phase tracking still avoids the old
+whole-output rescanning behavior.
 """
 
 from abc import abstractmethod
@@ -36,8 +37,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         pre_think -> thinking -> content
 
-    Transitions happen when start/end tokens are detected in the delta text.
-    No accumulated text scanning is performed — each token is O(1).
+    Transitions are tracked by parser state. Accumulated text is consulted only
+    to detect when a start/end tag has completed across delta boundaries.
     """
 
     @property
@@ -109,12 +110,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         Instead of rescanning the full accumulated text on every token, this
         method tracks the current phase (pre_think / thinking / content) and
-        only inspects the delta for tag transitions. This makes each call O(1)
-        regardless of how much text has been generated.
-
-        The method signature is kept compatible with the base class — previous_text
-        and current_text are accepted but not used for phase detection (they remain
-        available for subclasses that need them).
+        only consults accumulated text to detect completed start/end tags that
+        were split across delta boundaries.
 
         Handles three scenarios:
         1. Explicit <think>...</think> in model output
@@ -122,8 +119,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
         3. No tags at all (pure content after first token with no reasoning)
 
         Args:
-            previous_text: Text accumulated before this delta (unused by state machine).
-            current_text: Text including this delta (unused by state machine).
+            previous_text: Text accumulated before this delta.
+            current_text: Text including this delta.
             delta_text: Just the new text in this chunk.
 
         Returns:
@@ -136,34 +133,41 @@ class BaseThinkingReasoningParser(ReasoningParser):
         end_tok = self.end_token
 
         # ── Phase: pre_think ──────────────────────────────────────
-        # Haven't seen any tags yet. Could be:
+        # Haven't seen a completed tag yet. Could be:
         # - About to see <think> (explicit reasoning)
         # - Already inside implicit reasoning (think was in prompt)
         # - No reasoning at all (pure content model)
         if self._phase == "pre_think":
-            # Check for start tag in this delta
-            if start_tok in delta_text:
+            if start_tok in current_text:
                 self._phase = "thinking"
-                idx = delta_text.find(start_tok) + len(start_tok)
-                after = delta_text[idx:]
-                # Edge case: both tags in same delta
+                idx = delta_text.find(start_tok)
+                after = delta_text[idx + len(start_tok) :] if idx >= 0 else delta_text
+
                 if end_tok in after:
                     self._phase = "content"
                     eidx = after.find(end_tok)
                     reasoning = after[:eidx]
-                    content = after[eidx + len(end_tok):]
+                    content = after[eidx + len(end_tok) :]
+                    if not reasoning and not content:
+                        return None
                     return DeltaMessage(
                         reasoning=reasoning or None,
                         content=content or None,
                     )
                 return DeltaMessage(reasoning=after) if after else None
 
-            # Check for end tag (implicit mode — think was in prompt)
-            if end_tok in delta_text:
+            # Implicit mode: </think> completed without an explicit <think>.
+            if end_tok in current_text:
                 self._phase = "content"
                 idx = delta_text.find(end_tok)
-                reasoning = delta_text[:idx]
-                content = delta_text[idx + len(end_tok):]
+                if idx >= 0:
+                    reasoning = delta_text[:idx]
+                    content = delta_text[idx + len(end_tok) :]
+                else:
+                    reasoning = None
+                    content = delta_text
+                if not reasoning and not content:
+                    return None
                 return DeltaMessage(
                     reasoning=reasoning or None,
                     content=content or None,
@@ -178,11 +182,17 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # ── Phase: thinking ───────────────────────────────────────
         # Inside a reasoning block, waiting for end tag.
         if self._phase == "thinking":
-            if end_tok in delta_text:
+            if end_tok in current_text and end_tok not in previous_text:
                 self._phase = "content"
                 idx = delta_text.find(end_tok)
-                reasoning = delta_text[:idx]
-                content = delta_text[idx + len(end_tok):]
+                if idx >= 0:
+                    reasoning = delta_text[:idx]
+                    content = delta_text[idx + len(end_tok) :]
+                else:
+                    reasoning = delta_text
+                    content = None
+                if not reasoning and not content:
+                    return None
                 return DeltaMessage(
                     reasoning=reasoning or None,
                     content=content or None,

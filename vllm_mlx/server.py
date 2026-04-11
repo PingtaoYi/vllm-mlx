@@ -104,8 +104,6 @@ from .api.tool_calling import (
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
-    StreamingThinkRouter,
-    StreamingToolCallFilter,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -168,6 +166,11 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+
+# Pattern to strip leaked tool call markup from content output.
+# Safety net: the tool parser should consume these, but if it doesn't
+# (e.g. malformed JSON, stray closing tags), strip them before emitting.
+_TOOL_MARKUP_PATTERN = re.compile(r"</?tool_call>|</?tool_call_reasoning>")
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -349,6 +352,53 @@ def get_engine() -> BaseEngine:
     return _engine
 
 
+def _coerce_tool_arguments(
+    arguments_json: str, tool_name: str, tools: list[dict] | None
+) -> str:
+    """
+    Coerce tool call arguments to match the tool schema.
+
+    If a schema field expects "string" but the model produced an object/array,
+    JSON-stringify the value. This fixes a common LLM failure mode where models
+    output raw JSON objects instead of JSON strings for file content, etc.
+    """
+    if not tools:
+        return arguments_json
+
+    # Find the schema for this tool
+    schema = None
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("function", {}).get("name") == tool_name:
+            schema = tool["function"].get("parameters", {})
+            break
+
+    if not schema or "properties" not in schema:
+        return arguments_json
+
+    try:
+        arguments = json.loads(arguments_json)
+    except (json.JSONDecodeError, TypeError):
+        return arguments_json
+
+    if not isinstance(arguments, dict):
+        return arguments_json
+
+    properties = schema.get("properties", {})
+    changed = False
+
+    for key, value in arguments.items():
+        if key in properties:
+            expected_type = properties[key].get("type")
+            if expected_type == "string" and isinstance(value, (dict, list)):
+                arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
+                changed = True
+
+    if changed:
+        return json.dumps(arguments, ensure_ascii=False)
+
+    return arguments_json
+
+
 def _validate_model_name(request_model: str) -> None:
     """Validate that the request model name matches the served model."""
     if _model_name and request_model != _model_name:
@@ -414,13 +464,16 @@ def _parse_tool_calls_with_parser(
         _tool_parser_instance.reset()
         result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
+            tools = request_dict.get("tools") if request_dict else None
             tool_calls = [
                 ToolCall(
                     id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                     type="function",
                     function=FunctionCall(
                         name=tc["name"],
-                        arguments=tc["arguments"],
+                        arguments=_coerce_tool_arguments(
+                            tc["arguments"], tc["name"], tools
+                        ),
                     ),
                 )
                 for tc in result.tool_calls
@@ -499,6 +552,7 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
     mtp: bool = False,
     prefill_step_size: int = 2048,
@@ -542,6 +596,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -605,14 +660,11 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
-    engine_stats = _engine.get_stats() if _engine else {}
-
     return {
         "status": "healthy",
         "model_loaded": _engine is not None,
         "model_name": _model_name,
         "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
-        "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
 
@@ -1041,15 +1093,19 @@ async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
     poll_interval: float = 0.5,
+    heartbeat_interval: float = 5.0,
 ) -> AsyncIterator[str]:
     """Wrap streaming generator to abort on client disconnect.
 
     Uses asyncio racing: each __anext__() on the inner generator is
-    raced against a disconnect poller.  This catches disconnects even
-    during prefill when no chunks are being yielded for tens of seconds.
+    raced against a disconnect poller.  When neither completes within
+    ``heartbeat_interval`` seconds, an SSE comment is yielded as a
+    heartbeat.  This forces an ASGI write which triggers broken-pipe
+    detection — without heartbeats, ``is_disconnected()`` stays False
+    during long prefill because no data is written to the socket.
 
-    On disconnect, aclose() propagates down the generator chain to
-    engine_core.stream_outputs() finally-block → abort_request().
+    On disconnect, the cancellation propagates to stream_outputs()
+    finally-block → abort_request() → abort_prefill().
     """
     import time as _time
 
@@ -1058,7 +1114,9 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
+    logger.info(
+        f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s"
+    )
 
     async def _wait_disconnect():
         poll_count = 0
@@ -1075,21 +1133,28 @@ async def _disconnect_guard(
                 return
 
     chunk_count = 0
+    heartbeat_count = 0
     disconnect_task: asyncio.Task | None = None
     anext_task: asyncio.Task | None = None
     try:
         aiter = generator.__aiter__()
         disconnect_task = asyncio.create_task(_wait_disconnect())
+        anext_task = None
         while True:
-            anext_task = asyncio.ensure_future(aiter.__anext__())
+            if anext_task is None:
+                anext_task = asyncio.ensure_future(aiter.__anext__())
+
             done, _ = await asyncio.wait(
                 [anext_task, disconnect_task],
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=heartbeat_interval,
             )
+
             if disconnect_task in done:
                 logger.info(
                     f"[disconnect_guard] CLIENT DISCONNECTED after "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                    f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
+                    f"elapsed={_elapsed()}"
                 )
                 anext_task.cancel()
                 try:
@@ -1097,20 +1162,32 @@ async def _disconnect_guard(
                 except (asyncio.CancelledError, StopAsyncIteration):
                     pass
                 break
-            try:
-                chunk = anext_task.result()
-            except StopAsyncIteration:
-                logger.info(
-                    f"[disconnect_guard] generator exhausted normally, "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
-                )
-                break
-            chunk_count += 1
-            if chunk_count == 1:
-                logger.info(
-                    f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
-                )
-            yield chunk
+
+            if anext_task in done:
+                try:
+                    chunk = anext_task.result()
+                except StopAsyncIteration:
+                    logger.info(
+                        f"[disconnect_guard] generator exhausted normally, "
+                        f"{chunk_count} chunks, elapsed={_elapsed()}"
+                    )
+                    break
+                chunk_count += 1
+                if chunk_count == 1:
+                    logger.info(
+                        f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
+                    )
+                yield chunk
+                anext_task = None
+                continue
+
+            # Timeout — no chunk and no disconnect detected yet.
+            # Send SSE comment as heartbeat to force an ASGI write.
+            # If the client has disconnected, this write will fail and
+            # the next is_disconnected() poll will return True.
+            heartbeat_count += 1
+            yield ": heartbeat\n\n"
+
     except GeneratorExit:
         logger.info(
             f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
@@ -1130,7 +1207,8 @@ async def _disconnect_guard(
         #   anext_task.cancel() → CancelledError in stream_outputs()
         #   → finally block → abort_request() → request removed from scheduler
         logger.info(
-            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
+            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks, "
+            f"{heartbeat_count} heartbeats, elapsed={_elapsed()}"
         )
 
 
@@ -1235,10 +1313,18 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
+    # Resolve repetition penalty for completions
+    comp_rep_penalty = request.repetition_penalty
+
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_completion(engine, prompts[0], request),
+                stream_completion(
+                    engine,
+                    prompts[0],
+                    request,
+                    repetition_penalty=comp_rep_penalty,
+                ),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -1252,14 +1338,16 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
+        gen_kwargs = {
+            "max_tokens": request.max_tokens or _default_max_tokens,
+            "temperature": _resolve_temperature(request.temperature),
+            "top_p": _resolve_top_p(request.top_p),
+            "stop": request.stop,
+        }
+        if comp_rep_penalty is not None:
+            gen_kwargs["repetition_penalty"] = comp_rep_penalty
         output = await _wait_with_disconnect(
-            engine.generate(
-                prompt=prompt,
-                max_tokens=request.max_tokens or _default_max_tokens,
-                temperature=_resolve_temperature(request.temperature),
-                top_p=_resolve_top_p(request.top_p),
-                stop=request.stop,
-            ),
+            engine.generate(prompt=prompt, **gen_kwargs),
             raw_request,
             timeout=timeout,
         )
@@ -1415,12 +1503,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
+    # Resolve repetition penalty
+    rep_penalty = request.repetition_penalty
+
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
     }
+    if rep_penalty is not None:
+        chat_kwargs["repetition_penalty"] = rep_penalty
 
     # Add multimodal content
     if has_media:
@@ -1436,6 +1529,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
+    # Enable/disable thinking mode per request
+    if request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = request.enable_thinking
 
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
@@ -1472,8 +1569,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
+    # Skip reasoning parser when enable_thinking=False (no think tags expected)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
+    if _reasoning_parser and not tool_calls and request.enable_thinking is not False:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
@@ -1860,6 +1958,10 @@ async def _stream_anthropic_messages(
     Converts OpenAI streaming chunks to Anthropic event format:
     message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop
+
+    When a reasoning parser is active, emits a ``thinking`` content block
+    (index 0) for reasoning tokens and a ``text`` content block (index 1)
+    for the actual response, matching the Anthropic extended thinking format.
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
@@ -1898,160 +2000,171 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Stream pipeline: raw text → tool call filter → think router → emit
-    # - Tool call filter strips tool call markup (emitted as structured blocks later)
-    # - Think router separates reasoning from content into Anthropic blocks
-    #
-    # When a reasoning parser is configured (e.g. --reasoning-parser gemma4),
-    # it replaces the generic StreamingThinkRouter to handle model-specific
-    # reasoning formats (e.g. Gemma 4 <|channel>thought...<channel|>).
-    accumulated_text = ""
-    use_reasoning_parser = _reasoning_parser is not None
-    tool_filter = StreamingToolCallFilter()
+    use_reasoning = _reasoning_parser is not None
 
-    if use_reasoning_parser:
+    if use_reasoning:
         _reasoning_parser.reset_state()
-        think_router = None
-    else:
-        # Detect if the model's chat template injects <think> into the
-        # generation prompt. If so, the model starts in thinking mode and
-        # the opening tag never appears in the output stream.
-        _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-        _chat_template = ""
-        if _tokenizer and hasattr(_tokenizer, "chat_template"):
-            _chat_template = _tokenizer.chat_template or ""
-        _starts_thinking = (
-            "<think>" in _chat_template and "add_generation_prompt" in _chat_template
-        )
-        think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
 
-    prompt_tokens = 0
+    # Block index tracking: with reasoning parser we use index 0 for
+    # thinking and index 1 for text; without parser, index 0 for text.
+    thinking_block_started = False
+    text_block_started = False
+    thinking_index = 0
+    text_index = 1 if use_reasoning else 0
+
+    if not use_reasoning:
+        # No reasoning parser — start text block immediately
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        text_block_started = True
+
+    # Stream content deltas
+    accumulated_text = ""
     completion_tokens = 0
 
-    # Track which content blocks we've started
-    current_block_type = None  # "thinking" or "text"
-    block_index = 0
-    # For reasoning parser: track accumulated text for parser context
-    reasoning_accumulated = ""
+    # Tool call streaming suppression — prevents raw tool markup from leaking
+    # as text_delta events. Mirrors the OpenAI streaming path logic.
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_markup_possible = False
+    tool_choice = getattr(openai_request, "tool_choice", None)
+    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+            except Exception:
+                pass
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
 
         # Track token counts
-        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-            prompt_tokens = output.prompt_tokens
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        if delta_text:
-            # Accumulate raw text BEFORE special token cleaning for tool parsing
-            accumulated_text += delta_text
+        if not delta_text:
+            continue
 
-            # Filter special tokens for display
-            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        # Filter special tokens
+        filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if not filtered:
+            continue
 
-            if content:
-                # Stage 1: strip tool call markup
-                filtered = tool_filter.process(content)
-                if not filtered:
-                    continue
+        if not use_reasoning:
+            # Simple path — no reasoning parsing
+            accumulated_text += filtered
+            content_to_emit = filtered
 
-                if use_reasoning_parser:
-                    # Stage 2a: use reasoning parser for model-specific formats
-                    prev = reasoning_accumulated
-                    reasoning_accumulated += filtered
-                    delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                        prev, reasoning_accumulated, filtered
-                    )
-                    if delta_msg is None:
-                        continue
-                    pieces = []
-                    if delta_msg.reasoning:
-                        pieces.append(("thinking", delta_msg.reasoning))
-                    if delta_msg.content:
-                        pieces.append(("text", delta_msg.content))
+            # Filter tool call markup during streaming
+            if tool_parser and content_to_emit:
+                if not tool_markup_possible and "<" not in content_to_emit:
+                    tool_accumulated_text += content_to_emit
                 else:
-                    # Stage 2b: generic <think> tag router
-                    pieces = think_router.process(filtered)
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_to_emit
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_to_emit
+                    )
+                    if tool_result is None or "tool_calls" in tool_result:
+                        # Inside tool markup or tool calls detected — suppress
+                        continue
+                    content_to_emit = tool_result.get("content", "")
+                    if content_to_emit:
+                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
+                    if not content_to_emit:
+                        continue
 
-                events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index
-                )
-                for event in events:
-                    yield event
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
+            continue
 
-    # Flush remaining from tool filter
-    remaining = tool_filter.flush()
-    if remaining:
-        if use_reasoning_parser:
-            prev = reasoning_accumulated
-            reasoning_accumulated += remaining
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                prev, reasoning_accumulated, remaining
-            )
-            pieces = []
-            if delta_msg:
-                if delta_msg.reasoning:
-                    pieces.append(("thinking", delta_msg.reasoning))
-                if delta_msg.content:
-                    pieces.append(("text", delta_msg.content))
-        else:
-            pieces = think_router.process(remaining)
-        events, current_block_type, block_index = _emit_content_pieces(
-            pieces, current_block_type, block_index
+        # Reasoning parser path
+        previous_text = accumulated_text
+        accumulated_text += filtered
+        delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            previous_text, accumulated_text, filtered
         )
-        for event in events:
-            yield event
 
-    if not use_reasoning_parser:
-        flush_pieces = think_router.flush()
-        if flush_pieces:
-            events, current_block_type, block_index = _emit_content_pieces(
-                flush_pieces, current_block_type, block_index
-            )
-            for event in events:
-                yield event
+        if delta_msg is None:
+            continue
 
-    # Close final content block
-    if current_block_type is not None:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-        block_index += 1
+        if delta_msg.reasoning:
+            if not thinking_block_started:
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                thinking_block_started = True
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
+
+        if delta_msg.content:
+            content_to_emit = delta_msg.content
+
+            # Filter tool call markup during streaming
+            if tool_parser and content_to_emit:
+                if not tool_markup_possible and "<" not in content_to_emit:
+                    tool_accumulated_text += content_to_emit
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_to_emit
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_to_emit
+                    )
+                    if tool_result is None or "tool_calls" in tool_result:
+                        # Inside tool markup or tool calls detected — suppress
+                        continue
+                    content_to_emit = tool_result.get("content", "")
+                    if content_to_emit:
+                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
+                    if not content_to_emit:
+                        continue
+
+            if thinking_block_started and not text_block_started:
+                # Close thinking block, open text block
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_block_started = True
+            elif not text_block_started:
+                # No thinking was emitted, start text block at index 0
+                text_index = 0
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_block_started = True
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
+
+    # Close any open thinking block that was never followed by text
+    if thinking_block_started and not text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+        # Emit empty text block so response always has text content
+        text_index = thinking_index + 1
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        text_block_started = True
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
+    # Close text block
+    if text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
+
     # If there are tool calls, emit tool_use blocks
+    next_index = (text_index + 1) if text_block_started else 0
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = block_index + i
+            tool_index = next_index + i
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
                 tool_input = {}
 
-            # content_block_start for tool_use
-            tool_block_start = {
-                "type": "content_block_start",
-                "index": tool_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "input": {},
-                },
-            }
-            yield f"event: content_block_start\ndata: {json.dumps(tool_block_start)}\n\n"
-
-            # Send input as a single delta
-            input_json = json.dumps(tool_input)
-            input_delta = {
-                "type": "content_block_delta",
-                "index": tool_index,
-                "delta": {"type": "input_json_delta", "partial_json": input_json},
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n"
-
-            # content_block_stop
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input)}})}\n\n"
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
 
     # Determine stop reason
@@ -2061,7 +2174,7 @@ async def _stream_anthropic_messages(
     message_delta = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"input_tokens": prompt_tokens, "output_tokens": completion_tokens},
+        "usage": {"output_tokens": completion_tokens},
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
@@ -2069,7 +2182,7 @@ async def _stream_anthropic_messages(
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Anthropic messages (stream): prompt={prompt_tokens} + completion={completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     # Emit message_stop
@@ -2085,15 +2198,18 @@ async def stream_completion(
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
+    repetition_penalty: float | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
-    async for output in engine.stream_generate(
-        prompt=prompt,
-        max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=_resolve_temperature(request.temperature),
-        top_p=_resolve_top_p(request.top_p),
-        stop=request.stop,
-    ):
+    gen_kwargs = {
+        "max_tokens": request.max_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "stop": request.stop,
+    }
+    if repetition_penalty is not None:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+    async for output in engine.stream_generate(prompt=prompt, **gen_kwargs):
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",
@@ -2192,8 +2308,8 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
-        if _reasoning_parser and delta_text:
+        # Use reasoning parser if enabled (skip when enable_thinking=False)
+        if _reasoning_parser and delta_text and request.enable_thinking is not False:
             previous_text = accumulated_text
             accumulated_text += delta_text
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
@@ -2204,36 +2320,84 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
-            # Run tool parser on content delta (post-reasoning text only).
-            # The reasoning parser suppresses <think> tokens, so tool calls
-            # only appear in delta_msg.content after </think> is emitted.
-            if tool_parser and delta_msg.content:
-                content_delta = delta_msg.content
-                if not tool_markup_possible and "<" not in content_delta:
-                    tool_accumulated_text += content_delta
+            content = delta_msg.content
+            reasoning = delta_msg.reasoning
+
+            # Some models (e.g. MiniMax) wrap tool calls in <think>
+            # blocks, so reasoning parser captures tool call XML as
+            # reasoning while content stays None.  Redirect reasoning
+            # to the content stream so the tool parser can handle it.
+            if tool_parser and reasoning and not content:
+                _check = tool_accumulated_text + reasoning
+                if (
+                    "<minimax:tool_call>" in _check
+                    or "<tool_call>" in _check
+                    or '<invoke name="' in _check
+                ):
+                    content = reasoning
+                    reasoning = None
+
+            # Tool call parsing on content portion
+            if tool_parser and content:
+                if not tool_markup_possible and "<" not in content:
+                    tool_accumulated_text += content
+                    # Suppress whitespace-only content when tools are active;
+                    # avoids emitting stray newlines before tool call XML.
+                    if not content.strip():
+                        continue
                 else:
                     if not tool_markup_possible:
                         tool_markup_possible = True
-
                     tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content_delta
+                    tool_accumulated_text += content
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content_delta
+                        tool_previous, tool_accumulated_text, content
                     )
 
                     if tool_result is None:
-                        # Inside tool markup - suppress content
+                        # Inside tool markup - suppress content output
+                        if reasoning:
+                            # Still emit reasoning while buffering tool call
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=_model_name,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            reasoning=reasoning,
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                                usage=None,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
                         continue
 
                     if "tool_calls" in tool_result:
+                        # Emit structured tool calls
                         tool_calls_detected = True
-                        tool_chunk = ChatCompletionChunk(
+                        # Coerce arguments against tool schemas
+                        tools = (
+                            request.model_dump().get("tools")
+                            if request and request.tools
+                            else None
+                        )
+                        if tools:
+                            for tc in tool_result["tool_calls"]:
+                                fn = tc.get("function", {})
+                                if "arguments" in fn and "name" in fn:
+                                    fn["arguments"] = _coerce_tool_arguments(
+                                        fn["arguments"], fn["name"], tools
+                                    )
+                        chunk = ChatCompletionChunk(
                             id=response_id,
                             model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
+                                        tool_calls=tool_result["tool_calls"],
+                                        reasoning=reasoning,
                                     ),
                                     finish_reason=(
                                         "tool_calls" if output.finished else None
@@ -2242,11 +2406,14 @@ async def stream_chat_completion(
                             ],
                             usage=get_usage(output) if output.finished else None,
                         )
-                        yield f"data: {tool_chunk.model_dump_json()}\n\n"
+                        yield f"data: {chunk.model_dump_json()}\n\n"
                         continue
 
-                    # Update content with what the tool parser returned
-                    delta_msg.content = tool_result.get("content", "") or None
+                    # Normal content from tool parser
+                    content = tool_result.get("content", "")
+                    # Strip any leaked tool markup tags
+                    if content:
+                        content = _TOOL_MARKUP_PATTERN.sub("", content)
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2254,10 +2421,14 @@ async def stream_chat_completion(
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
+                            content=content if content else None,
+                            reasoning=reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (output.finish_reason if output.finished else None)
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
@@ -2300,6 +2471,19 @@ async def stream_chat_completion(
                     if "tool_calls" in tool_result:
                         # Emit structured tool calls
                         tool_calls_detected = True
+                        # Coerce arguments against tool schemas
+                        tools = (
+                            request.model_dump().get("tools")
+                            if request and request.tools
+                            else None
+                        )
+                        if tools:
+                            for tc in tool_result["tool_calls"]:
+                                fn = tc.get("function", {})
+                                if "arguments" in fn and "name" in fn:
+                                    fn["arguments"] = _coerce_tool_arguments(
+                                        fn["arguments"], fn["name"], tools
+                                    )
                         chunk = ChatCompletionChunk(
                             id=response_id,
                             model=_model_name,
@@ -2320,6 +2504,9 @@ async def stream_chat_completion(
 
                     # Normal content from tool parser
                     content = tool_result.get("content", "")
+                    # Strip any leaked tool markup tags
+                    if content:
+                        content = _TOOL_MARKUP_PATTERN.sub("", content)
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2353,6 +2540,9 @@ async def stream_chat_completion(
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:
+            tools = (
+                request.model_dump().get("tools") if request and request.tools else None
+            )
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
@@ -2366,7 +2556,9 @@ async def stream_chat_completion(
                                     "type": "function",
                                     "function": {
                                         "name": tc["name"],
-                                        "arguments": tc["arguments"],
+                                        "arguments": _coerce_tool_arguments(
+                                            tc["arguments"], tc["name"], tools
+                                        ),
                                     },
                                 }
                                 for i, tc in enumerate(result.tool_calls)

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -254,6 +254,10 @@ def _install_chunked_prefill(
             batch.tokens,
         )
         mx.async_eval(batch.y, batch.logprobs)
+        # Evaluate accumulated tokens to prevent Metal buffer buildup
+        # from lazy mx.concatenate() chains holding AGXAllocation handles
+        if batch.tokens:
+            mx.async_eval(*batch.tokens)
 
         y = y.tolist()
         self._stats.generation_time += _time.perf_counter() - tic_gen
@@ -742,6 +746,10 @@ def _install_mtp(
 
         # --- Apply logits processors + sample primary ---
         if any(logits_processors):
+            logger.debug(
+                f"[logits_proc] applying {sum(len(lp) for lp in logits_processors)} "
+                f"processors to batch_size={batch_size}"
+            )
             processed_logits = []
             for e in range(batch_size):
                 sample_logits = logits[e : e + 1]
@@ -1188,11 +1196,7 @@ class Scheduler:
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
         if request_id not in self._detokenizer_pool:
-            if hasattr(self.tokenizer, "detokenizer"):
-                detok = self.tokenizer.detokenizer
-            else:
-                detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
-            detok.reset()
+            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
             self._detokenizer_pool[request_id] = detok
         return self._detokenizer_pool[request_id]
 
@@ -1885,15 +1889,30 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Build per-request logits_processors from repetition_penalty
+            rep_penalty = request.sampling_params.repetition_penalty
+            lp = None
+            if rep_penalty and rep_penalty != 1.0:
+                lp = make_logits_processors(repetition_penalty=rep_penalty)
+                logger.info(
+                    f"[rep_penalty] request={request.request_id[:12]} "
+                    f"penalty={rep_penalty} processors={len(lp)}"
+                )
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
+            insert_kwargs = {
+                "max_tokens": [request.sampling_params.max_tokens],
+                "caches": [cache_to_use] if cache_to_use else None,
+            }
+            if lp:
+                insert_kwargs["logits_processors"] = [lp]
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
-                    caches=[cache_to_use] if cache_to_use else None,
+                    **insert_kwargs,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1906,10 +1925,10 @@ class Scheduler:
                     request.cached_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
+                    insert_kwargs["caches"] = None
                     uids = self.batch_generator.insert(
                         [tokens_to_process],
-                        max_tokens=[request.sampling_params.max_tokens],
-                        caches=None,
+                        **insert_kwargs,
                     )
                 else:
                     raise
@@ -1930,11 +1949,16 @@ class Scheduler:
                     else ""
                 )
                 tokens_to_prefill = len(tokens_to_process)
+                rep_info = (
+                    f" rep_penalty={rep_penalty}"
+                    if rep_penalty and rep_penalty != 1.0
+                    else ""
+                )
                 logger.info(
                     f"[schedule] request={request.request_id[:12]} uid={uid} "
                     f"prompt_tokens={request.num_prompt_tokens} "
                     f"tokens_to_prefill={tokens_to_prefill}{cache_info} "
-                    f"max_tokens={request.sampling_params.max_tokens} "
+                    f"max_tokens={request.sampling_params.max_tokens}{rep_info} "
                     f"running={len(self.running)} waiting={len(self.waiting)}"
                 )
 

@@ -771,7 +771,15 @@ class MemoryAwarePrefixCache:
                 f"layer_types={[type(lc).__name__ for lc in best_lcp_entry.cache[:3]]}"
             )
 
-            if not has_non_trimmable:
+            if has_non_trimmable:
+                # Hybrid model (SSM+Attention): SSM state can't be rewound.
+                # Block LCP for hybrid models — use think-suffix stripping
+                # in the engine layer to get clean PREFIX matches instead.
+                logger.debug(
+                    "[cache_fetch] LCP skipped: non-trimmable cache layers "
+                    "(hybrid model, SSM state can't be rewound)"
+                )
+            else:
                 trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
                 self._entries.move_to_end(best_lcp_entry.tokens)
                 self._stats.hits += 1

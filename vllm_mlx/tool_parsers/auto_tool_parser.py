@@ -122,7 +122,7 @@ class AutoToolParser(ToolParser):
                     content=content if content else None,
                 )
 
-        # 2. Try Qwen bracket pattern
+        # 3. Try Qwen bracket pattern
         bracket_matches = self.QWEN_BRACKET_PATTERN.findall(model_output)
         for name, args_str in bracket_matches:
             try:
@@ -150,7 +150,7 @@ class AutoToolParser(ToolParser):
         if bracket_matches:
             cleaned_text = self.QWEN_BRACKET_PATTERN.sub("", cleaned_text).strip()
 
-        # 3. Try Nemotron pattern (before Qwen XML as it's more specific)
+        # 4. Try Nemotron pattern (before Qwen XML as it's more specific)
         nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
         for name, params_block in nemotron_matches:
             params = self.NEMOTRON_PARAM_PATTERN.findall(params_block)
@@ -166,7 +166,7 @@ class AutoToolParser(ToolParser):
         if nemotron_matches:
             cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
 
-        # 4. Try Qwen/Hermes XML pattern
+        # 5. Try Qwen/Hermes XML pattern
         xml_matches = self.QWEN_XML_PATTERN.findall(cleaned_text)
         for match in xml_matches:
             try:
@@ -191,7 +191,7 @@ class AutoToolParser(ToolParser):
         if xml_matches:
             cleaned_text = self.QWEN_XML_PATTERN.sub("", cleaned_text).strip()
 
-        # 5. Try Llama pattern
+        # 6. Try Llama pattern
         llama_matches = self.LLAMA_PATTERN.findall(cleaned_text)
         for name, args_str in llama_matches:
             try:
@@ -219,7 +219,7 @@ class AutoToolParser(ToolParser):
         if llama_matches:
             cleaned_text = self.LLAMA_PATTERN.sub("", cleaned_text).strip()
 
-        # 6. Fallback: Try raw JSON
+        # 7. Fallback: Try raw JSON
         if not tool_calls:
             raw_calls = self._parse_raw_json_tool_calls(cleaned_text)
             if raw_calls:

@@ -6,7 +6,10 @@ Shows how to use vllm-mlx with the OpenAI Python SDK for image understanding.
 
 Usage:
     1. Start the server with a VLM model:
-       vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+       # Without a custom API model name (model path is the name used in the OpenAI API):
+       vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+       # With a custom API model name ("my-model" is the name used in the OpenAI API):
+       vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
     2. Run this script:
        python examples/demo_openai_image.py

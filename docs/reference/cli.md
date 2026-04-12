@@ -22,6 +22,7 @@ vllm-mlx serve <model> [options]
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `--served-model-name` | Custom model name exposed through the OpenAI API. If not set, the model path is used as the name. | None |
 | `--port` | Server port | 8000 |
 | `--host` | Server host | 0.0.0.0 |
 | `--api-key` | API key for authentication | None |
@@ -49,7 +50,12 @@ vllm-mlx serve <model> [options]
 
 ```bash
 # Simple mode (single user, max throughput)
+# Model path is used as the model name in the OpenAI API (e.g. model="mlx-community/Llama-3.2-3B-Instruct-4bit")
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
+
+# With a custom API model name (model is accessed as "my-model" via the OpenAI API)
+# --served-model-name sets the name clients must use when calling the API (e.g. model="my-model")
+vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit
 
 # Continuous batching (multiple users)
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching

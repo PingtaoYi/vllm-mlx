@@ -7,7 +7,10 @@ and supports text, images, and video files.
 
 Usage:
     # First start the server with a multimodal model:
-    vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    # Without a custom API model name (model path is the name used in the OpenAI API):
+    vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    # With a custom API model name ("my-model" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
     # Then run this app:
     vllm-mlx-chat
@@ -268,7 +271,10 @@ Examples:
     vllm-mlx-chat --share
 
 Note: Make sure the vllm-mlx server is running with a multimodal model:
-    vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    # Without a custom API model name (model path is the name used in the OpenAI API):
+    vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    # With a custom API model name ("my-model" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
         """,
     )
     parser.add_argument(

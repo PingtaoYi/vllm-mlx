@@ -7,7 +7,10 @@ Use this for text conversations without image/video overhead.
 
 Usage:
     # First start the server with a model:
-    vllm-mlx --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # Without a custom API model name (model path is the name used in the OpenAI API):
+    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # With a custom API model name ("my-model" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
     # Then run this app:
     vllm-mlx-text-chat
@@ -116,7 +119,10 @@ Examples:
     vllm-mlx-text-chat --share
 
 Note: Make sure the vllm-mlx server is running:
-    vllm-mlx --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # Without a custom API model name (model path is the name used in the OpenAI API):
+    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # With a custom API model name ("my-model" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
         """,
     )
     parser.add_argument(

@@ -121,7 +121,7 @@ Examples:
     # name OpenAI returns from /v1/models can be set with --served-model-name, for example:
     vllm-mlx-text-chat --served-model-name <served-model name>
     # example starting chat on the first model served on localhost:8000:
-    vllm-mlx-text-chat --served-model-name $(curl http://localhost:8000/v1/models | jq ".data[0].id)
+    vllm-mlx-text-chat --served-model-name $(curl http://localhost:8000/v1/models | jq ".data[0].id")
 
     # Connect to a different server
     vllm-mlx-text-chat --server-url http://localhost:9000

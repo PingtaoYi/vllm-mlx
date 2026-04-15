@@ -15,8 +15,6 @@ Usage:
     # Or with a different served-model name served on localhost:8000:
     vllm-mlx-chat --served-model-name <served-model-name>  --server-url http://localhost:8000 --port 7860
 
-
-
 Note:
     Query the /v1/models endpoint on localhost with `curl` and `jq` to see available models and their names:
     ```bash

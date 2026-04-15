@@ -58,8 +58,7 @@ Model will show up as 'mlx-community/Llama-3.2-3B-Instruct-4bit' in the `/v1/mod
 # With a custom API model name (model is accessed as "my-model" via the OpenAI API)
 # --served-model-name sets the name clients must use when calling the API (e.g. model="my-model")
 vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit
-
-Model will show up as 'my-model' in the `/v1/models` API endpoint.
+# Note: Model will show up as 'my-model' in the `/v1/models` API endpoint.
 
 # Continuous batching (multiple users)
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching

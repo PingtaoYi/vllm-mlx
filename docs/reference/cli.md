@@ -6,6 +6,7 @@
 |---------|-------------|
 | `vllm-mlx serve` | Start OpenAI-compatible server |
 | `vllm-mlx model` | Inspect, acquire, or convert model artifacts |
+| `vllm-mlx bench-serve` | Benchmark a running server with prompt sweeps or workload contracts |
 | `vllm-mlx-bench` | Run performance benchmarks |
 | `vllm-mlx-chat` | Start Gradio chat interface |
 
@@ -191,79 +192,47 @@ vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct \
   --quantize --q-bits 4 --q-group-size 64 --q-mode affine
 ```
 
+## `vllm-mlx bench-serve`
+
+Benchmark a running vllm-mlx server over HTTP. Prompt-sweep mode measures
+TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
+per-case quality checks and comparison-only product policy timeouts.
+
+### Usage
+
+```bash
+vllm-mlx bench-serve --url http://localhost:8000 [options]
+```
+
+### Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--url` | Running server base URL | `http://127.0.0.1:8080` |
+| `--model` | API model id | Auto-detect |
+| `--prompts` | Comma-separated prompt sets or files for sweep mode | `short,medium,long` |
+| `--workload` | Declarative workload JSON for contract mode | None |
+| `--concurrency` | Comma-separated concurrency levels for sweep mode | `1,4` |
+| `--max-tokens` | Max tokens for sweep mode | `256` |
+| `--enable-thinking` | `true`, `false`, or `true,false` sweep | None |
+| `--scrape-metrics` | Scrape `/metrics` before/after runs | `true` |
+| `--include-content` | Include full generated content in workload JSON | False |
+| `--request-timeout-s` | Workload HTTP transport timeout, `0` disables | `300` |
+| `--output` | Output file | stdout |
+| `--format` | Output format: `table`, `json`, `csv`, `sql` | `table` for prompt sweeps, `json` for workloads |
+
+### Examples
+
+```bash
+# Prompt sweep
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --prompts short,long --concurrency 1,4 --format json --output bench.json
+
+# Contract workload with quality checks and policy-timeout evidence
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload workload.json --output workload-results.json
+```
+
 ## `vllm-mlx-bench`
 
 Run performance benchmarks.
-
-### Usage
-
-```bash
-vllm-mlx-bench --model <model> [options]
-```
-
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--model` | Model name | Required |
-| `--prompts` | Number of prompts | 5 |
-| `--max-tokens` | Max tokens per prompt | 256 |
-| `--quick` | Quick benchmark mode | False |
-| `--video` | Run video benchmark | False |
-| `--video-url` | Custom video URL | None |
-| `--video-path` | Custom video path | None |
-
-### Examples
-
-```bash
-# LLM benchmark
-vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit
-
-# Quick benchmark
-vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --quick
-
-# Image benchmark (auto-detected for VLM models)
-vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit
-
-# Video benchmark
-vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video
-
-# Custom video
-vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit \
-  --video --video-url https://example.com/video.mp4
-```
-
-## `vllm-mlx-chat`
-
-Start Gradio chat interface.
-
-### Usage
-
-```bash
-vllm-mlx-chat --served-model-name <model-name> [options]
-```
-
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--model` | Model name | Required |
-| `--port` | Gradio port | 7860 |
-| `--text-only` | Disable multimodal | False |
-
-### Examples
-
-```bash
-# Multimodal chat (text + images + video)
-vllm-mlx-chat --served-model-name mlx-community/Qwen3-VL-4B-Instruct-3bit
-
-# Text-only chat
-vllm-mlx-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit --text-only
-```
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `VLLM_MLX_TEST_MODEL` | Model for tests |
-| `HF_TOKEN` | HuggingFace token |

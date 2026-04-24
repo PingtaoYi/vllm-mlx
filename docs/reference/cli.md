@@ -196,7 +196,9 @@ vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct \
 
 Benchmark a running vllm-mlx server over HTTP. Prompt-sweep mode measures
 TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
-per-case quality checks and comparison-only product policy timeouts.
+per-case quality checks and comparison-only product policy timeouts. Workload
+cases can embed `messages` directly or point `request_path` at an existing
+OpenAI-compatible request JSON.
 
 ### Usage
 

@@ -305,6 +305,27 @@ def test_register_model_writes_manifest_from_artifact(tmp_path):
     assert (artifact / REGISTRATION_MANIFEST_NAME).exists()
 
 
+def test_register_model_minimal_defaults(tmp_path):
+    """register_model with only artifact_path derives model_id from directory name."""
+    artifact = tmp_path / "my-cool-model"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(
+        json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+    )
+
+    payload = register_model(RegistrationOptions(artifact_path=str(artifact)))
+
+    assert payload["model_id"] == "my-cool-model"
+    assert payload["served_model_name"] == "my-cool-model"
+    assert payload["preset_alias"] is None
+    assert payload["mllm"] is None
+    assert payload["serving_defaults"] == {}
+    assert payload["parser_policy"] == {}
+    assert payload["feature_flags"] == []
+    assert payload["qualification_required"] is True
+    assert (artifact / REGISTRATION_MANIFEST_NAME).exists()
+
+
 def test_register_model_requires_local_directory(tmp_path):
     missing = tmp_path / "missing"
 
@@ -314,6 +335,19 @@ def test_register_model_requires_local_directory(tmp_path):
         pass
     else:
         raise AssertionError("expected FileNotFoundError")
+
+
+def test_register_model_rejects_file_as_artifact(tmp_path):
+    """register_model raises NotADirectoryError for a file path."""
+    file_path = tmp_path / "not-a-dir.safetensors"
+    file_path.write_bytes(b"weights")
+
+    try:
+        register_model(RegistrationOptions(artifact_path=str(file_path)))
+    except NotADirectoryError:
+        pass
+    else:
+        raise AssertionError("expected NotADirectoryError")
 
 
 def test_qualify_model_dry_run_records_bench_command(tmp_path):
@@ -340,6 +374,26 @@ def test_qualify_model_dry_run_records_bench_command(tmp_path):
     assert output.exists()
 
 
+def test_qualify_model_runs_command_and_records_success(tmp_path):
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="all passed", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        payload = qualify_model(
+            QualificationOptions(
+                model_id="qwen-test",
+                workload_path="/tmp/workload.json",
+                output_path=str(tmp_path / "result.json"),
+            )
+        )
+
+    assert payload["status"] == "succeeded"
+    assert payload["returncode"] == 0
+    assert payload["stdout"] == "all passed"
+    assert "completed_at" in payload
+    assert (tmp_path / "result.json").exists()
+
+
 def test_qualify_model_runs_command_and_records_failure(tmp_path):
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=7, stdout="", stderr="bad workload")
@@ -355,3 +409,25 @@ def test_qualify_model_runs_command_and_records_failure(tmp_path):
     assert payload["status"] == "failed"
     assert payload["returncode"] == 7
     assert payload["stderr"] == "bad workload"
+
+
+def test_drop_none_preserves_zero_and_false_values():
+    """_drop_none must keep 0, 0.0, and False -- only drop None."""
+    from vllm_mlx.model_workflow import _drop_none
+
+    result = _drop_none(
+        {
+            "temperature": 0.0,
+            "top_k": 0,
+            "presence_penalty": 0.0,
+            "enabled": False,
+            "missing": None,
+        }
+    )
+    assert result == {
+        "temperature": 0.0,
+        "top_k": 0,
+        "presence_penalty": 0.0,
+        "enabled": False,
+    }
+    assert "missing" not in result

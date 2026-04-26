@@ -1551,8 +1551,18 @@ Examples:
         action="store_true",
         help="Generate a quantized MLX model",
     )
-    model_convert_parser.add_argument("--q-bits", type=int, default=None)
-    model_convert_parser.add_argument("--q-group-size", type=int, default=None)
+    model_convert_parser.add_argument(
+        "--q-bits",
+        type=int,
+        default=None,
+        help="Quantization bit width (e.g. 3, 4, 8)",
+    )
+    model_convert_parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=None,
+        help="Quantization group size (default: mlx-lm default)",
+    )
     model_convert_parser.add_argument(
         "--q-mode",
         choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
@@ -1590,38 +1600,90 @@ Examples:
         type=str,
         help="Finalized local model artifact directory",
     )
-    model_register_parser.add_argument("--model-id", type=str, default=None)
-    model_register_parser.add_argument("--served-model-name", type=str, default=None)
-    model_register_parser.add_argument("--preset-alias", type=str, default=None)
+    model_register_parser.add_argument(
+        "--model-id",
+        type=str,
+        default=None,
+        help="Override model ID (default: directory name of artifact)",
+    )
+    model_register_parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Model name exposed by the API (default: model-id)",
+    )
+    model_register_parser.add_argument(
+        "--preset-alias",
+        type=str,
+        default=None,
+        help="Optional alias for preset lookup in registry",
+    )
     model_register_parser.add_argument(
         "--output",
         type=str,
         default=None,
         help="Manifest path. Defaults to artifact/vllm_mlx_registration_manifest.json",
     )
-    model_register_parser.add_argument(
+    mllm_group = model_register_parser.add_mutually_exclusive_group()
+    mllm_group.add_argument(
         "--mllm",
         action="store_true",
         default=None,
         help="Mark the artifact as an MLLM serving candidate",
     )
-    model_register_parser.add_argument("--tool-call-parser", type=str, default=None)
-    model_register_parser.add_argument("--reasoning-parser", type=str, default=None)
-    model_register_parser.add_argument(
-        "--default-temperature", type=float, default=None
+    mllm_group.add_argument(
+        "--no-mllm",
+        action="store_false",
+        dest="mllm",
+        help="Explicitly mark the artifact as text-only",
     )
-    model_register_parser.add_argument("--default-top-p", type=float, default=None)
-    model_register_parser.add_argument("--default-top-k", type=int, default=None)
-    model_register_parser.add_argument("--default-min-p", type=float, default=None)
+    model_register_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        help="Tool call parser name for the model (e.g. qwen3_coder, mistral)",
+    )
+    model_register_parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        help="Reasoning parser name for thinking models (e.g. qwen3)",
+    )
+    model_register_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for all requests",
+    )
     model_register_parser.add_argument(
         "--default-presence-penalty",
         type=float,
         default=None,
+        help="Default presence_penalty for all requests",
     )
     model_register_parser.add_argument(
         "--default-repetition-penalty",
         type=float,
         default=None,
+        help="Default repetition_penalty for all requests",
     )
     model_register_parser.add_argument(
         "--default-chat-template-kwargs",
@@ -1640,7 +1702,11 @@ Examples:
         "qualify",
         help="Create or run a bench-serve qualification handoff",
     )
-    model_qualify_parser.add_argument("model_id", type=str)
+    model_qualify_parser.add_argument(
+        "model_id",
+        type=str,
+        help="Model ID to qualify against the running server",
+    )
     model_qualify_parser.add_argument(
         "--url",
         type=str,
@@ -1665,7 +1731,12 @@ Examples:
         default=None,
         help="Result output path passed to bench-serve",
     )
-    model_qualify_parser.add_argument("--repetitions", type=int, default=None)
+    model_qualify_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Number of repetitions per benchmark sweep configuration",
+    )
     model_qualify_parser.add_argument(
         "--dry-run",
         action="store_true",

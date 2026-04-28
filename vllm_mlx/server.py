@@ -4750,7 +4750,7 @@ async def create_anthropic_message(
                         anthropic_terminal,
                     ),
                     request,
-                    cleanup=_make_release_cleanup(raw_request),
+                    cleanup=_make_release_cleanup(request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4877,7 +4877,7 @@ async def create_anthropic_message(
         )
     finally:
         if release_on_exit:
-            await _release_engine_for_request(raw_request)
+            await _release_engine_for_request(request)
 
 
 @app.post(

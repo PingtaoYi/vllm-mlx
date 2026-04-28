@@ -822,7 +822,8 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
         monkeypatch.setattr(
-            "mlx_lm.models.cache.make_prompt_cache", lambda model: [FakeCache()]
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda model, **kwargs: [FakeCache()],
         )
         monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", fake_make_sampler)
         monkeypatch.setattr(
@@ -830,6 +831,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
@@ -884,6 +886,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             return mx.array([11]), [mx.array([0.2, 0.8])]
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1088,6 +1091,7 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         processor = RetiredProcessor()
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1137,6 +1141,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                 return logits
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1180,7 +1185,7 @@ class TestBatchedMLLMConfigWiring:
         captured = {}
 
         class FakeMLXMultimodalLM:
-            def __init__(self, model_name, trust_remote_code=True):
+            def __init__(self, model_name, trust_remote_code=True, **kwargs):
                 self.model_name = model_name
                 self.model = object()
                 self.processor = object()
@@ -1254,6 +1259,7 @@ class TestPreprocessIdempotent:
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.max_kv_size = 0
         gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
             gen, MLLMBatchGenerator
         )
@@ -1277,6 +1283,7 @@ class TestPreprocessIdempotent:
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.max_kv_size = 0
         gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
             gen, MLLMBatchGenerator
         )
@@ -1302,6 +1309,7 @@ class TestChunkedPrefillCacheHandling:
         gen.stop_tokens = set()
         gen.unprocessed_requests = []
         gen._think_suffix_len = 0
+        gen.max_kv_size = 0
 
         # _has_empty_rotating_cache — always False for test caches
         gen._has_empty_rotating_cache = lambda cache: False

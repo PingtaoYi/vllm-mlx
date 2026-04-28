@@ -160,7 +160,14 @@ from .endpoint_model_policies import (
 )
 from .engine.base import suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
+from .model_registry import (
+    ModelLease,
+    ModelManager,
+    RegistryServeDefaults,
+    load_registry_config,
+)
 from .metrics import metrics as _metrics
+from .reasoning import get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -170,6 +177,7 @@ _IMPORTED_SIMPLE_ENGINE = SimpleEngine
 
 # Global engine instance
 _engine: BaseEngine | None = None
+_model_manager: ModelManager | None = None
 _model_name: str | None = None
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
@@ -671,6 +679,7 @@ _auth_warning_logged: bool = False
 
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
+_reasoning_parser_name: str | None = None
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
@@ -725,6 +734,95 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+@dataclass
+class RequestModelContext:
+    """Request-scoped engine/lease context."""
+
+    model_name: str
+    engine: BaseEngine
+    lease: ModelLease | None = None
+
+    async def release(self) -> None:
+        if self.lease is not None:
+            lease = self.lease
+            self.lease = None
+            await lease.release()
+
+
+def _list_available_model_names() -> list[str]:
+    if _model_manager is not None:
+        return _model_manager.registered_model_names
+    return [_model_name] if _model_name else []
+
+
+async def _acquire_request_model(request_model: str) -> RequestModelContext:
+    """Acquire the model/engine that should serve this request."""
+    _validate_model_name(request_model)
+
+    if _model_manager is None:
+        engine = get_engine()
+        engine.preserve_native_tool_format = _detect_native_tool_support()
+        return RequestModelContext(
+            model_name=_model_name or request_model, engine=engine
+        )
+
+    try:
+        lease = await _model_manager.acquire(request_model)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    lease.engine.preserve_native_tool_format = _detect_native_tool_support()
+    return RequestModelContext(
+        model_name=request_model,
+        engine=lease.engine,
+        lease=lease,
+    )
+
+
+async def _stream_with_model_context(
+    context: RequestModelContext,
+    stream: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """Ensure model leases survive for the full streaming response."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await context.release()
+
+
+def _build_tool_parser(engine: BaseEngine | None):
+    """Create a fresh tool parser instance for a single request/stream."""
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return None
+
+    if _tool_parser_instance is not None:
+        if hasattr(_tool_parser_instance, "reset"):
+            _tool_parser_instance.reset()
+        return _tool_parser_instance
+
+    parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
+    return parser_cls(tokenizer)
+
+
+def _build_reasoning_parser(engine: BaseEngine | None = None):
+    """Create a fresh reasoning parser instance for a single request/stream."""
+    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
+    if _reasoning_parser_name is not None:
+        parser_cls = get_reasoning_parser(_reasoning_parser_name)
+        try:
+            return parser_cls(tokenizer)
+        except TypeError:
+            return parser_cls()
+    if _reasoning_parser is None:
+        return None
+    try:
+        return type(_reasoning_parser)(tokenizer)
+    except TypeError:
+        return type(_reasoning_parser)()
 
 
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
@@ -999,7 +1097,7 @@ async def _release_default_engine(*, count_activity: bool = True) -> None:
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager, _lifecycle_task, _lifespan_active
+    global _engine, _mcp_manager, _model_manager, _lifecycle_task, _lifespan_active
     primary_exc: BaseException | None = None
     try:
         _get_idle_unload_event().clear()
@@ -1014,6 +1112,8 @@ async def lifespan(app: FastAPI):
             _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded
         ):
             await _engine.start()
+        if _model_manager is not None:
+            await _model_manager.preload()
 
         # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
         if (
@@ -1096,6 +1196,9 @@ async def lifespan(app: FastAPI):
             await _engine.stop()
             _engine = None
             logger.info("Engine stopped")
+        if _model_manager is not None:
+            await _model_manager.shutdown()
+            logger.info("Model manager stopped")
     except BaseException as exc:
         cleanup_exc = exc
     finally:
@@ -1327,6 +1430,18 @@ def _coerce_tool_arguments(
 
 def _validate_model_name(request_model: str) -> None:
     """Validate that the request model name matches the served model."""
+    if _model_manager is not None:
+        if not _model_manager.has_model(request_model):
+            available = ", ".join(f"`{name}`" for name in _list_available_model_names())
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"The model `{request_model}` does not exist. "
+                    f"Available models: {available}"
+                ),
+            )
+        return
+
     if _model_name and request_model != _model_name:
         raise HTTPException(
             status_code=404,
@@ -2585,7 +2700,7 @@ def load_model(
             resident load until the first request instead of FastAPI lifespan
             startup.
     """
-    global _engine, _model_name, _model_path, _default_max_tokens
+    global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
     global _default_model_key, _auto_unload_idle_seconds, _residency_manager
     global _force_mllm_model, _lazy_load_model, _lifespan_active
@@ -2633,6 +2748,7 @@ def load_model(
 
     _default_max_tokens = max_tokens
     _max_request_tokens = max_request_tokens
+    _model_manager = None
     _model_path = model_name
     _model_name = served_model_name or model_name
     _default_model_key = "default"
@@ -2744,6 +2860,29 @@ def load_model(
     logger.info(f"Max request tokens: {_max_request_tokens}")
 
 
+def load_model_registry(
+    config_path: str,
+    *,
+    defaults: RegistryServeDefaults,
+) -> None:
+    """Load a registry-backed model manager from YAML configuration."""
+    global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
+
+    manager_config, registry = load_registry_config(config_path, defaults)
+    _engine = None
+    _model_path = None
+    _model_name = None
+    _default_max_tokens = defaults.max_tokens
+    _model_manager = ModelManager(manager_config, registry, defaults)
+
+    logger.info(
+        "Loaded models config: %s (%d models, %.1f GB budget)",
+        config_path,
+        len(registry),
+        manager_config.memory_budget_bytes / (1024**3),
+    )
+
+
 def get_usage(output: GenerationOutput) -> Usage:
     """Extract usage metrics from GenerationOutput."""
     total_prompt_tokens = (
@@ -2798,8 +2937,9 @@ async def health():
 
     payload = {
         "status": health_status,
-        "model_loaded": _engine is not None,
+        "model_loaded": _engine is not None or _model_manager is not None,
         "model_name": _model_name,
+        "available_models": _list_available_model_names(),
         "model_type": (
             "mllm"
             if (_engine and _engine.is_mllm)
@@ -2833,6 +2973,16 @@ async def health():
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
+    if _model_manager is not None:
+        return {
+            "status": "running",
+            "model_manager": {
+                "memory_budget_gb": round(
+                    _model_manager.memory_budget_bytes / (1024**3), 2
+                ),
+                "models": _model_manager.list_models(),
+            },
+        }
     lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
         return {
@@ -3035,7 +3185,9 @@ async def delete_request(request_id: str):
 async def list_models() -> ModelsResponse:
     """List available models."""
     models = []
-    if _model_name:
+    if _model_manager is not None:
+        models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
+    elif _model_name:
         models.append(ModelInfo(id=_model_name))
     if _embedding_engine is not None:
         models.append(
@@ -3846,14 +3998,51 @@ def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
     return remaining
 
 
+_active_request_contexts: dict[int, RequestModelContext] = {}
+
+
 async def _acquire_default_engine_for_request(
     raw_request: Request,
     *,
     total_timeout: float,
     deadline: float,
     count_activity: bool = True,
+    model: str | None = None,
 ) -> BaseEngine | None:
-    """Acquire the default engine inside the request guardrails."""
+    """Acquire the engine for a request, using the model registry when active.
+
+    When ``_model_manager`` is set (registry mode), acquires the engine for the
+    requested *model* via ``_acquire_request_model``.  The resulting
+    ``RequestModelContext`` is stashed in ``_active_request_contexts`` keyed by
+    ``id(raw_request)`` so that the matching ``_release_default_engine`` call
+    can release the lease.
+
+    In single-model mode the behaviour is unchanged.
+    """
+    if _model_manager is not None and model is not None:
+
+        async def _registry_acquire():
+            ctx = await _acquire_request_model(model)
+            if raw_request is not None:
+                _active_request_contexts[id(raw_request)] = ctx
+            return ctx.engine
+
+        async def _registry_cleanup(_result):
+            ctx = _active_request_contexts.pop(id(raw_request), None)
+            if ctx is not None:
+                await ctx.release()
+
+        if raw_request is None:
+            return await _registry_acquire()
+
+        return await _wait_with_disconnect(
+            _registry_acquire(),
+            raw_request,
+            timeout=_remaining_request_timeout(total_timeout, deadline),
+            timeout_detail_seconds=total_timeout,
+            cleanup_result=lambda _r: _registry_cleanup(_r),
+        )
+
     if count_activity:
         acquire_coro = _acquire_default_engine()
         cleanup = lambda _result: _release_default_engine()
@@ -3871,6 +4060,36 @@ async def _acquire_default_engine_for_request(
         timeout_detail_seconds=total_timeout,
         cleanup_result=cleanup,
     )
+
+
+async def _release_engine_for_request(raw_request: Request | None) -> None:
+    """Release the engine acquired for this request.
+
+    In registry mode, releases the model lease stashed by
+    ``_acquire_default_engine_for_request``.  In single-model mode, falls
+    through to the default release path.
+    """
+    if raw_request is not None:
+        ctx = _active_request_contexts.pop(id(raw_request), None)
+        if ctx is not None:
+            await ctx.release()
+            return
+    await _release_default_engine()
+
+
+def _make_release_cleanup(raw_request: Request | None):
+    """Return a cleanup callable suitable for ``_disconnect_guard``."""
+    if _model_manager is not None and raw_request is not None:
+
+        async def _cleanup():
+            ctx = _active_request_contexts.pop(id(raw_request), None)
+            if ctx is not None:
+                await ctx.release()
+            else:
+                await _release_default_engine()
+
+        return _cleanup
+    return _release_default_engine
 
 
 # =============================================================================
@@ -3911,6 +4130,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         raw_request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -3932,7 +4152,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4017,7 +4237,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 @app.post(
@@ -4102,6 +4322,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         raw_request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4128,7 +4349,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4212,7 +4433,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
@@ -4493,6 +4714,7 @@ async def create_anthropic_message(
         request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=openai_request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4521,7 +4743,7 @@ async def create_anthropic_message(
                         anthropic_terminal,
                     ),
                     request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4648,7 +4870,7 @@ async def create_anthropic_message(
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 @app.post(
@@ -4674,6 +4896,7 @@ async def count_anthropic_tokens(request: Request):
         total_timeout=total_timeout,
         deadline=deadline,
         count_activity=False,
+        model=request_model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4735,7 +4958,7 @@ async def count_anthropic_tokens(request: Request):
 
         return {"input_tokens": total_tokens}
     finally:
-        await _release_default_engine(count_activity=False)
+        await _release_engine_for_request(request)
 
 
 def _emit_content_pieces(
@@ -5733,9 +5956,10 @@ def main():
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
-        global _reasoning_parser
+        global _reasoning_parser, _reasoning_parser_name
         from .reasoning import get_parser
 
+        _reasoning_parser_name = args.reasoning_parser
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")

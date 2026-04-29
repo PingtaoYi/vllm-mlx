@@ -2,6 +2,8 @@
 """Tests for SimpleEngine concurrency handling."""
 
 import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -296,6 +298,50 @@ class TestSimpleEngineConcurrency:
         assert observed is sentinel_stream
 
     @pytest.mark.anyio
+    async def test_llm_stream_generate_stays_on_model_load_thread(self):
+        """SimpleEngine must load and stream on the same thread for MLX streams."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self._load_thread = None
+                self.tokenizer = MagicMock()
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                self._load_thread = threading.get_ident()
+
+            def stream_generate(self, **_kwargs):
+                if threading.get_ident() != self._load_thread:
+                    raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+                yield SimpleNamespace(
+                    text="ok",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+        ):
+            engine = SimpleEngine("test-model")
+
+            outputs = [
+                chunk
+                async for chunk in engine.stream_generate(
+                    prompt="hello",
+                    max_tokens=1,
+                    temperature=0.0,
+                    top_p=1.0,
+                )
+            ]
+
+        assert outputs
+        assert outputs[-1].new_text == "ok"
+        assert outputs[-1].finished is True
+
+    @pytest.mark.anyio
     async def test_start_keeps_text_routing_for_mllm_without_mtp(self):
         """MLLM text-only routing must stay available when MTP is disabled."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -357,6 +403,75 @@ class TestSimpleEngineConcurrency:
         assert output.completion_tokens == 1
         assert output.finish_reason == "stop"
         engine._model.chat.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_mllm_nonstream_text_only_without_text_model_uses_stream_path(self):
+        """When TextModel is unavailable, text-only MLLM non-stream chat should
+        aggregate stream_chat to avoid mlx_vlm chat thread-stream mismatches.
+        """
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def chat(self, **kwargs):
+                raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+
+            def stream_chat(self, **kwargs):
+                yield SimpleNamespace(text="one, two, three", finish_reason="stop")
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = None
+        engine._model = FakeMllmModel()
+
+        output = await engine.chat(
+            messages=[{"role": "user", "content": "Count: one, two, three"}],
+            max_tokens=16,
+        )
+
+        assert output.text == "one, two, three"
+        assert output.finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_mllm_nonstream_text_only_without_text_model_keeps_stream_thread_owner(
+        self,
+    ):
+        """MLLM text-only non-stream path must keep stream_chat on model thread.
+
+        Regression: aggregate_stream_chat -> stream_chat used _run_blocking_serialized,
+        which moved mlx_vlm stream generation to a worker thread and could raise
+        "There is no Stream(gpu, N) in current thread".
+        """
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def __init__(self):
+                self._owner_thread = threading.get_ident()
+
+            def stream_chat(self, **kwargs):
+                if threading.get_ident() != self._owner_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                )
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = None
+        engine._model = FakeMllmModel()
+
+        output = await engine.chat(
+            messages=[{"role": "user", "content": "Count: one, two, three"}],
+            max_tokens=16,
+        )
+
+        assert output.text == "one, two, three"
+        assert output.finish_reason == "stop"
 
     @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
